@@ -1,0 +1,84 @@
+# convert 1000 Genomes project phase 3 reference
+for chr in {1..22} X; do
+  tabix -f chrs/chr$chr.1kg.phase3.v5a.vcf.gz
+  bcftools norm -Ou -m -any chrs/chr$chr.1kg.phase3.v5a.vcf.gz |
+    bcftools norm -Ou -f human_g1k_v37.fasta |
+    bcftools annotate -Ob -x ID \
+      -I +'%CHROM:%POS:%REF:%ALT' |
+    plink --bcf /dev/stdin \
+      --keep-allele-order \
+      --vcf-idspace-to _ \
+      --const-fid \
+      --allow-extra-chr 0 \
+      --split-x b37 no-fail \
+      --make-bed \
+      --out chrs/kgp.chr$chr
+done
+
+# impute sex using chromosome X
+plink --bfile chrs/kgp.chrX \
+  --keep-allele-order \
+  --impute-sex .95 .95 \
+  --make-bed \
+  --out chrs/kgp.chrX && \
+  /bin/rm chrs/kgp.chrX.{bed,bim,fam}~
+
+# check for duplicate markers (there are 11,943 such markers, mostly on the X chromosome, unfortunately)
+for chr in {{1..22},X,Y,MT}; do cut -f2 chrs/kgp.chr$chr.bim | sort | uniq -c | awk '$1>=2 {print $2}'; done > kgp.dups
+
+# check for very long indels (there are 46 of these)
+cut -f2 chrs/kgp.chr{{1..22},X,Y,MT}.bim | awk 'length($1)>=150' | sort | uniq > kgp.longindels
+
+# generate version of each chromosome without duplicate variants
+for chr in {1..22} X; do
+  cat kgp.{dups,longindels} |
+    plink --bfile chrs/kgp.chr$chr \
+      --keep-allele-order \
+      --exclude /dev/stdin \
+      --make-bed \
+      --out chrs/kgp.clean.chr$chr
+done
+
+# join all chromosomes into one
+cat kgp.clean.chrX.fam > kgp.fam
+cat kgp.clean.chr{{1..22},X}.bim > kgp.bim
+(echo -en "\x6C\x1B\x01"; tail -qc +4 kgp.clean.chr{{1..22},X}.bed) > kgp.bed
+
+# download population information
+wget ftp://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/integrated_call_samples_v3.20130502.ALL.panel
+awk 'BEGIN {print "FID\tIID\tPOP"} NR>1 {print "0\t"$1"\t"$2}' integrated_call_samples_v3.20130502.ALL.panel > kgp.pop
+
+# compute principal component analysis weights
+plink --bfile kgp --maf .01 --indep 50 5 2 --out kgp
+plink --bfile kgp --extract kgp.prune.in --make-grm-bin --out kgp
+gcta64 --grm-bin kgp --pca 20 --out kgp --thread-num 10
+(echo FID IID PC{1..20}; cat kgp.eigenvec) > kgp.pca
+
+# convert to map files
+plink --bfile <bed file prefix> --recode12 --out <new prefix>
+
+# repeat the same steps more or less for the study.vcf.gz
+# then find common snps
+# R code:
+map2 = read.delim("kgp.map", header=F, quote="")
+map1 = read.delim("study.map", header=F, quote="")
+common.snps = which(map2$V2 %in% map1$V2)
+write.table(map2$V2[common.snps], file="list.snps", sep="\t", col.names=F, row.names=F, quote=F )
+
+# prep bed files with common snps
+# the Plink commands:
+plink --bfile kgp --extract list.snps --make-bed --out reference
+plink --bfile study --extract list.snps --make-bed --out study
+
+# Verify the two datasets have the same set of SNPs
+% diff -s reference.bim study.bim
+# Run supervised ADMIXTURE with K=5 in a multi-threaded fashion with N=20 threads
+% admixture reference.bed 5 --supervised -j20
+# Use learned allele frequencies as (fixed) input to next step
+% cp reference.5.P study.5.P.in
+# Run projection ADMIXTURE with K=5
+% admixture -P study.bed 5
+
+
+#Reference:
+#1. #Instructions for preprocessing 1000 genomes vcfs: http://apol1.blogspot.com/2016/10/1000-#genomes-project-phase-3-principal.html
